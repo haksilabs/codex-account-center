@@ -1,6 +1,7 @@
 from pathlib import Path
 import runpy
 import socket
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -24,6 +25,17 @@ class Clock:
 
 
 class DesktopResumeTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        (root / 'ipc').mkdir()
+        (root / 'ipc/ipc.sock').touch()
+        # Socket I/O is mocked below; only the existence check needs a fixture.
+        patcher = patch.dict(GLOBALS, CODEX_DIR=root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def invoke(self, replies, open_errors=None):
         clock = Clock()
         calls = []

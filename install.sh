@@ -9,6 +9,11 @@ fi
 if [[ $# -gt 1 || ( $# -eq 1 && "$1" != "--replace" ) ]]; then
   echo "Unknown option. Use --help." >&2; exit 2
 fi
+for source in src/codex-acc src/codex_auto_switch.py systemd/codex-auto-switch.service; do
+  if [[ ! -f "$project_dir/$source" ]]; then
+    echo "Incomplete source package: $source is missing." >&2; exit 1
+  fi
+done
 if [[ "$EUID" -eq 0 ]]; then echo "Run as your normal desktop user, without sudo." >&2; exit 1; fi
 files=("$HOME/.local/bin/codex-acc" "$HOME/.local/share/codex-auto-switch/codex_auto_switch.py" "$HOME/.config/systemd/user/codex-auto-switch.service" "$HOME/.local/share/applications/codex-account-center.desktop")
 for target in "${files[@]}"; do

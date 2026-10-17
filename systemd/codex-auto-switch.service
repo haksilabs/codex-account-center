@@ -1,0 +1,14 @@
+[Unit]
+Description=Codex Account Center optional switching and continuation monitor
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/share/codex-auto-switch/codex_auto_switch.py --watch --apply --allow-restart
+Restart=on-failure
+RestartSec=15
+UMask=0077
+KillMode=process
+
+[Install]
+WantedBy=default.target
