@@ -1,0 +1,2294 @@
+#!/usr/bin/env python3
+"""
+Codex Account Center — unofficial Linux desktop companion
+GUI (GTK4/Libadwaita) & CLI
+Manages locally saved ChatGPT/Codex accounts and fetches remaining usage quotas,
+switches accounts at <= threshold%, and automatically resumes interrupted work.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import concurrent.futures
+import json
+import os
+import signal
+import fcntl
+import re
+import shutil
+import socket
+import sqlite3
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from datetime import datetime, timedelta, timezone
+from contextlib import closing
+from pathlib import Path
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
+
+CODEX_DIR = Path.home() / ".codex"
+AUTH_FILE = CODEX_DIR / "auth.json"
+ACCOUNTS_DIR = CODEX_DIR / "accounts"
+META_FILE = ACCOUNTS_DIR / "_meta.json"
+
+CODEX_BIN = (
+    "/usr/lib/chatgpt/resources/codex"
+    if os.path.exists("/usr/lib/chatgpt/resources/codex")
+    else shutil.which("codex") or "codex"
+)
+OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+TOKEN_URL = "https://auth.openai.com/oauth/token"
+
+
+DEFAULT_AUTO_CONFIG = {
+    "codex_auto_switch": True,
+    "codex_auto_resume": True,
+    "codex_threshold": 2,
+    "check_interval": 30,
+    "cooldown": 90,
+    "resume_prompt": (
+        "The account limit was reached and a different account is now active. "
+        "Check unfinished work and continue from where you left off."
+    ),
+}
+
+
+def ensure_dirs():
+    ACCOUNTS_DIR.mkdir(parents=True, exist_ok=True)
+    for d in (ACCOUNTS_DIR,):
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+
+
+def decode_jwt_payload(token: str) -> dict:
+    if not token or "." not in token:
+        return {}
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {}
+        payload = parts[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload).decode("utf-8", errors="ignore"))
+    except Exception:
+        return {}
+
+
+def format_duration_tr(seconds: int | float | None) -> str:
+    if seconds is None or seconds <= 0:
+        return "now"
+    seconds = int(seconds)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts = []
+    if days > 0:
+        parts.append(f"{days}d")
+    if hours > 0:
+        parts.append(f"{hours}h")
+    if days == 0 and minutes > 0:
+        parts.append(f"{minutes}m")
+    if not parts:
+        return "<1m"
+    return " ".join(parts)
+
+
+def format_iso_reset_tr(iso_str: str | None) -> str:
+    if not iso_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        diff = (dt - datetime.now(timezone.utc)).total_seconds()
+        return format_duration_tr(diff)
+    except Exception:
+        return ""
+
+
+def load_meta() -> dict:
+    if META_FILE.exists():
+        try:
+            return json.loads(META_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"aliases": {}}
+
+
+def save_meta(meta: dict):
+    ensure_dirs()
+    META_FILE.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def get_auto_config() -> dict:
+    meta = load_meta()
+    saved = meta.get("auto_switch_config") or {}
+    cfg = dict(DEFAULT_AUTO_CONFIG)
+    cfg.update(saved)
+    return cfg
+
+
+def save_auto_config(new_cfg: dict) -> dict:
+    meta = load_meta()
+    cfg = dict(DEFAULT_AUTO_CONFIG)
+    cfg.update(meta.get("auto_switch_config") or {})
+    cfg.update(new_cfg)
+    meta["auto_switch_config"] = cfg
+    save_meta(meta)
+    return cfg
+
+
+# ============================================================================
+# 1. CODEX (CHATGPT) ACCOUNT & QUOTA MANAGEMENT
+# ============================================================================
+
+def parse_auth_data(data: dict) -> dict:
+    tokens = data.get("tokens") or {}
+    id_claims = decode_jwt_payload(tokens.get("id_token", ""))
+    access_claims = decode_jwt_payload(tokens.get("access_token", ""))
+
+    auth_info = (
+        id_claims.get("https://api.openai.com/auth")
+        or access_claims.get("https://api.openai.com/auth")
+        or {}
+    )
+
+    email = id_claims.get("email") or access_claims.get("email") or ""
+    name = id_claims.get("name") or ""
+    plan = (auth_info.get("chatgpt_plan_type") or "").upper()
+    sub_until_raw = auth_info.get("chatgpt_subscription_active_until") or ""
+    sub_until = ""
+    if sub_until_raw:
+        try:
+            dt = datetime.fromisoformat(sub_until_raw.replace("Z", "+00:00"))
+            sub_until = dt.strftime("%d.%m.%Y")
+        except Exception:
+            sub_until = sub_until_raw[:10]
+
+    account_id = (
+        tokens.get("account_id")
+        or auth_info.get("chatgpt_account_id")
+        or id_claims.get("sub")
+        or ""
+    )
+    user_id = auth_info.get("user_id") or id_claims.get("sub") or ""
+
+    orgs = auth_info.get("organizations") or []
+    org_title = ""
+    for org in orgs:
+        if org.get("is_default"):
+            org_title = org.get("title") or ""
+            break
+    if not org_title and orgs:
+        org_title = orgs[0].get("title") or ""
+
+    if not email and data.get("OPENAI_API_KEY"):
+        key = data["OPENAI_API_KEY"]
+        email = "API key " + hashlib.sha256(key.encode()).hexdigest()[:10]
+        plan = "API"
+
+    key_slug = email if email else (account_id[:12] if account_id else "unknown")
+    safe_filename = re.sub(r"[^a-zA-Z0-9_.@-]", "_", key_slug)
+
+    return {
+        "email": email or "Unknown account",
+        "name": name,
+        "plan": plan or "CHATGPT",
+        "sub_until": sub_until,
+        "account_id": account_id,
+        "user_id": user_id,
+        "org_title": org_title,
+        "safe_filename": safe_filename,
+        "last_refresh": data.get("last_refresh") or "",
+    }
+
+
+def refresh_account_tokens(file_path: Path, data: dict) -> dict | None:
+    tokens = data.get("tokens") or {}
+    refresh_tok = tokens.get("refresh_token")
+    if not refresh_tok:
+        return None
+    payload = json.dumps(
+        {
+            "client_id": OAUTH_CLIENT_ID,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_tok,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        TOKEN_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "codex-cli/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+        if "access_token" in res:
+            tokens["access_token"] = res["access_token"]
+        if "id_token" in res:
+            tokens["id_token"] = res["id_token"]
+        if "refresh_token" in res:
+            tokens["refresh_token"] = res["refresh_token"]
+        data["tokens"] = tokens
+        data["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        raw = json.dumps(data, indent=2)
+        file_path.write_text(raw, encoding="utf-8")
+        os.chmod(file_path, 0o600)
+
+        if AUTH_FILE.exists():
+            try:
+                cur = json.loads(AUTH_FILE.read_text(encoding="utf-8"))
+                if (cur.get("tokens") or {}).get("account_id") == tokens.get("account_id"):
+                    AUTH_FILE.write_text(raw, encoding="utf-8")
+                    os.chmod(AUTH_FILE, 0o600)
+            except Exception:
+                pass
+        return data
+    except Exception:
+        return None
+
+
+def fetch_account_limits(acc: dict) -> dict:
+    """
+    Calls https://chatgpt.com/backend-api/wham/usage for a saved account file
+    and parses both 5-hour (18000s) and weekly (604800s) remaining percentages.
+    """
+    file_path = Path(acc["file_path"])
+    try:
+        data = json.loads(file_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    tokens = data.get("tokens") or {}
+    access_token = tokens.get("access_token")
+    account_id = tokens.get("account_id") or acc.get("account_id")
+    if not access_token:
+        return {"ok": False, "error": "No access token"}
+
+    def _call_wham(path: str, tok: str, method: str = "GET", body: dict | None = None):
+        headers = {
+            "Authorization": f"Bearer {tok}",
+            "Accept": "application/json",
+            "User-Agent": "codex-cli/1.0",
+        }
+        if account_id:
+            headers["ChatGPT-Account-Id"] = account_id
+        data_bytes = None
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            data_bytes = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            f"https://chatgpt.com/backend-api/wham/{path.lstrip('/')}",
+            data=data_bytes,
+            headers=headers,
+            method=method,
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    active_tok = access_token
+    try:
+        usage = _call_wham("usage", active_tok)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            refreshed = refresh_account_tokens(file_path, data)
+            if refreshed:
+                active_tok = refreshed["tokens"]["access_token"]
+                try:
+                    usage = _call_wham("usage", active_tok)
+                except Exception as e2:
+                    return {"ok": False, "error": f"Error after refresh: {e2}"}
+            else:
+                return {"ok": False, "error": "Session expired (sign in again)"}
+        else:
+            return {"ok": False, "error": f"HTTP {e.code}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+    rl = usage.get("rate_limit") or {}
+    allowed = rl.get("allowed", True)
+    limit_reached = rl.get("limit_reached", False)
+
+    win_5h = None
+    win_weekly = None
+
+    for key in ("primary_window", "secondary_window"):
+        w = rl.get(key)
+        if not w:
+            continue
+        secs = w.get("limit_window_seconds") or 0
+        if secs <= 86400:
+            win_5h = w
+        else:
+            win_weekly = w
+
+    if not win_5h and not win_weekly:
+        return {"ok": False, "error": "No usage windows reported", "plan_type": (usage.get("plan_type") or "").upper()}
+    if any("used_percent" not in w or w["used_percent"] is None for w in (win_5h, win_weekly) if w):
+        return {"ok": False, "error": "Usage percentage unavailable"}
+    has_5h_cap = win_5h is not None
+    if win_5h:
+        used_5h = int(round(win_5h.get("used_percent") or 0))
+        rem_5h = max(0, 100 - used_5h)
+        reset_5h = format_duration_tr(win_5h.get("reset_after_seconds"))
+    else:
+        used_5h = 0
+        rem_5h = 100
+        reset_5h = ""
+
+    if win_weekly:
+        used_wk = int(round(win_weekly.get("used_percent") or 0))
+        rem_wk = max(0, 100 - used_wk)
+        reset_wk = format_duration_tr(win_weekly.get("reset_after_seconds"))
+    else:
+        used_wk = 0
+        rem_wk = 100
+        reset_wk = ""
+
+    # Parse rate_limit_reset_credits, extra credits, and reset history
+    rc_summary = usage.get("rate_limit_reset_credits") or {}
+    reset_available = int(rc_summary.get("available_count") or 0)
+    reset_applicable = int(rc_summary.get("applicable_available_count") or 0)
+    reset_total_earned = 0
+    reset_credit_id = None
+    reset_expires_str = ""
+
+    try:
+        rc_detail = _call_wham("rate-limit-reset-credits", active_tok)
+        reset_available = max(reset_available, int(rc_detail.get("available_count") or 0))
+        reset_total_earned = int(rc_detail.get("total_earned_count") or 0)
+        avail_list = [c for c in (rc_detail.get("credits") or []) if c.get("status") == "available"]
+        if avail_list:
+            reset_credit_id = avail_list[0].get("id")
+            exp_raw = avail_list[0].get("expires_at")
+            if exp_raw:
+                reset_expires_str = format_iso_reset_tr(exp_raw)
+    except Exception:
+        pass
+
+    granted_30d_count = 0
+    used_30d_count = 0
+    last_granted_str = ""
+    last_used_str = ""
+
+    def _fmt_local_dt(iso_s: str | None) -> str:
+        if not iso_s:
+            return ""
+        try:
+            dt = datetime.fromisoformat(iso_s.replace("Z", "+00:00")).astimezone()
+            return dt.strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            return iso_s[:10]
+
+    try:
+        rc_hist = _call_wham("rate-limit-reset-credits/history", active_tok)
+        events = rc_hist.get("events") or []
+        granted_ev = [ev for ev in events if ev.get("kind") == "granted"]
+        used_ev = [ev for ev in events if ev.get("kind") == "used"]
+        granted_30d_count = len(granted_ev)
+        used_30d_count = len(used_ev)
+        if granted_ev:
+            last_granted_str = _fmt_local_dt(granted_ev[0].get("occurred_at"))
+        if used_ev:
+            last_used_str = _fmt_local_dt(used_ev[0].get("occurred_at"))
+    except Exception:
+        pass
+
+    credits_obj = usage.get("credits") or {}
+    has_credits = bool(credits_obj.get("has_credits")) or bool(credits_obj.get("unlimited"))
+    credits_balance = str(credits_obj.get("balance") or "0")
+    promo_obj = usage.get("promo")
+
+    return {
+        "ok": True,
+        "allowed": allowed and not limit_reached,
+        "limit_reached": limit_reached,
+        "has_5h_cap": has_5h_cap,
+        "has_weekly_cap": win_weekly is not None,
+        "rem_5h": rem_5h,
+        "used_5h": used_5h,
+        "reset_5h": reset_5h,
+        "rem_weekly": rem_wk,
+        "used_weekly": used_wk,
+        "reset_weekly": reset_wk,
+        "plan_type": (usage.get("plan_type") or "").upper(),
+        "reset_available": reset_available,
+        "reset_applicable": reset_applicable,
+        "reset_total_earned": max(reset_total_earned, granted_30d_count),
+        "reset_credit_id": reset_credit_id,
+        "reset_expires": reset_expires_str,
+        "granted_30d_count": granted_30d_count,
+        "used_30d_count": used_30d_count,
+        "last_granted_str": last_granted_str,
+        "last_used_str": last_used_str,
+        "has_credits": has_credits,
+        "credits_balance": credits_balance,
+        "promo": promo_obj,
+    }
+
+
+def consume_codex_reset_credit(acc: dict, credit_id: str | None = None) -> dict:
+    """
+    Redeems an available Codex rate-limit reset credit via
+    POST https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume
+    """
+    file_path = Path(acc["file_path"])
+    try:
+        data = json.loads(file_path.read_text(encoding="utf-8"))
+        tokens = data.get("tokens") or {}
+        access_token = tokens.get("access_token")
+        account_id = tokens.get("account_id") or acc.get("account_id")
+        if not access_token:
+            return {"ok": False, "error": "No access token"}
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "codex-cli/1.0",
+        }
+        if account_id:
+            headers["ChatGPT-Account-Id"] = account_id
+        payload = json.dumps(
+            {
+                "credit_id": credit_id,
+                "redeem_request_id": str(uuid.uuid4()),
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume",
+            data=payload,
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+        return {"ok": True, "code": res.get("code", "reset"), "response": res}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def fetch_all_limits_parallel(accounts: list[dict]) -> dict[str, dict]:
+    results = {}
+    if not accounts:
+        return results
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        fut_map = {ex.submit(fetch_account_limits, acc): acc["id_key"] for acc in accounts}
+        for fut in concurrent.futures.as_completed(fut_map):
+            key = fut_map[fut]
+            try:
+                results[key] = fut.result()
+            except Exception as e:
+                results[key] = {"ok": False, "error": str(e)}
+    return results
+
+
+def sync_current_auth() -> dict | None:
+    """
+    Reads ~/.codex/auth.json and saves/updates its corresponding profile in ~/.codex/accounts/
+    so rotated refresh_tokens are never lost.
+    """
+    ensure_dirs()
+    if not AUTH_FILE.exists():
+        return None
+    try:
+        raw = AUTH_FILE.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if not data.get("tokens") and not data.get("OPENAI_API_KEY"):
+            return None
+        info = parse_auth_data(data)
+        target = ACCOUNTS_DIR / f"{info['safe_filename']}.json"
+        target.write_text(raw, encoding="utf-8")
+        os.chmod(target, 0o600)
+        info["file_path"] = str(target)
+        info["id_key"] = target.stem
+        return info
+    except Exception:
+        return None
+
+
+def list_accounts() -> tuple[list[dict], dict | None]:
+    ensure_dirs()
+    current = sync_current_auth()
+    meta = load_meta()
+    aliases = meta.get("aliases") or {}
+
+    accounts = []
+    for p in sorted(ACCOUNTS_DIR.glob("*.json")):
+        if p.name.startswith("_"):
+            continue
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            info = parse_auth_data(data)
+            info["file_path"] = str(p)
+            info["id_key"] = p.stem
+            info["alias"] = aliases.get(p.stem, "")
+            is_active = False
+            if current:
+                if current.get("email") == info.get("email") and current.get("account_id") == info.get("account_id"):
+                    is_active = True
+            info["is_active"] = is_active
+            accounts.append(info)
+        except Exception:
+            continue
+
+    accounts.sort(key=lambda x: (0 if x["is_active"] else 1, x["email"].lower()))
+    return accounts, current
+
+
+def _chatgpt_main_pids() -> list[int]:
+    """Exclude Electron renderer/zygote processes and other users' sessions."""
+    found = []
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            if proc.stat().st_uid != os.getuid():
+                continue
+            if proc.joinpath("exe").resolve() != Path("/usr/lib/chatgpt/ChatGPT"):
+                continue
+            args = proc.joinpath("cmdline").read_bytes().split(b"\0")
+            if not args or any(re.search(rb"(?:^|\s)--type=", arg) for arg in args):
+                continue
+            if proc.joinpath("stat").read_text().split(") ", 1)[1].startswith("Z"):
+                continue
+            found.append(int(proc.name))
+        except (OSError, IndexError):
+            pass
+    return found
+
+
+def is_chatgpt_app_running() -> bool:
+    return bool(_chatgpt_main_pids())
+
+
+def _desktop_launch_environment() -> dict[str, str]:
+    """Refresh the watcher environment after graphical-session login.
+
+    A boot-started user service can lack DISPLAY/WAYLAND_DISPLAY indefinitely.
+    Import only display-session variables, never another process's credentials.
+    """
+    env = os.environ.copy()
+    keys = {"DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE",
+            "DBUS_SESSION_BUS_ADDRESS", "HYPRLAND_INSTANCE_SIGNATURE", "XAUTHORITY"}
+    try:
+        manager = subprocess.run(["systemctl", "--user", "show-environment"],
+                                 capture_output=True, text=True, timeout=3)
+        for line in manager.stdout.splitlines():
+            key, sep, value = line.partition("=")
+            if sep and key in keys and value:
+                env[key] = value
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    runtime = Path(env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    env["XDG_RUNTIME_DIR"] = str(runtime)
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={runtime}/bus")
+    display = env.get("WAYLAND_DISPLAY", "")
+    if not display or not (runtime / display).is_socket():
+        sockets = [p for p in runtime.glob("wayland-*") if p.is_socket()]
+        if len(sockets) == 1:
+            env["WAYLAND_DISPLAY"] = sockets[0].name
+        else:
+            env.pop("WAYLAND_DISPLAY", None)
+    if env.get("WAYLAND_DISPLAY"):
+        env["XDG_SESSION_TYPE"] = "wayland"
+    env.pop("ELECTRON_RUN_AS_NODE", None)
+    return env
+
+
+def _desktop_ipc_ready() -> bool:
+    """A read-only handshake proves the app server is accepting connections."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(0.7)
+        sock.connect(str(CODEX_DIR / "ipc" / "ipc.sock"))
+        rid = str(uuid.uuid4())
+        _ipc_send_frame(sock, {"type": "request", "requestId": rid,
+            "sourceClientId": "initializing-client", "version": 1,
+            "method": "initialize", "params": {"clientType": "cli"}})
+        response = _ipc_recv_frame(sock, timeout=0.7)
+        return bool(response and response.get("requestId") == rid
+                    and response.get("resultType") == "success")
+    except (OSError, ValueError):
+        return False
+    finally:
+        sock.close()
+
+
+def _desktop_window_ready(env: dict) -> bool:
+    if not env.get("HYPRLAND_INSTANCE_SIGNATURE") or not shutil.which("hyprctl"):
+        return True  # Other desktops rely on the main-process + IPC checks.
+    try:
+        result = subprocess.run(["hyprctl", "clients", "-j"], env=env,
+                                capture_output=True, text=True, timeout=2)
+        if result.returncode:
+            return False
+        return any(w.get("mapped") and w.get("class", "").lower() == "chatgpt"
+                   for w in json.loads(result.stdout))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False
+
+
+def _stop_chatgpt_app():
+    """Stop the desktop and only its descendants; wait out Electron shutdown."""
+    roots = set(_chatgpt_main_pids())
+    if not roots:
+        return
+    children = set(roots)
+    parents = {}
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            if proc.stat().st_uid == os.getuid():
+                parents[int(proc.name)] = int(proc.joinpath("stat").read_text().split(") ", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            pass
+    for _ in range(12):
+        additions = {pid for pid, parent in parents.items() if parent in children} - children
+        if not additions:
+            break
+        children.update(additions)
+    for pid in roots:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 10
+    while is_chatgpt_app_running() and time.monotonic() < deadline:
+        time.sleep(0.2)
+    # Never pkill every codex app-server: unrelated CLI sessions may own one.
+    for pid in children:
+        try:
+            os.kill(pid, signal.SIGKILL if pid in roots else signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 3
+    while is_chatgpt_app_running() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if is_chatgpt_app_running():
+        raise RuntimeError("Codex could not close. Restart cancelled.")
+
+
+def _launch_chatgpt_and_wait(env: dict, timeout: float = 35.0) -> dict:
+    log_dir = Path.home() / ".local" / "state" / "codex-acc"
+    log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    log_path = log_dir / "desktop-launch.log"
+    # Record launcher stderr locally, never print authentication data to the UI.
+    if log_path.exists() and log_path.stat().st_size > 512_000:
+        log_path.write_bytes(b"")
+    with log_path.open("ab") as log:
+        os.chmod(log_path, 0o600)
+        proc = subprocess.Popen(["/usr/bin/chatgpt"], env=env, stdout=log, stderr=log,
+                                start_new_session=True)
+    deadline = time.monotonic() + max(1.0, timeout)
+    while time.monotonic() < deadline:
+        if is_chatgpt_app_running() and _desktop_ipc_ready() and _desktop_window_ready(env):
+            return {"ok": True, "app_ready": True, "method": "desktop_window_and_ipc"}
+        code = proc.poll()
+        if code is not None and code != 0 and not is_chatgpt_app_running():
+            raise RuntimeError(f"Codex could not launch (exit {code}). Launch log: {log_path}")
+        time.sleep(0.4)
+    raise RuntimeError(f"Codex did not become ready. Launch log: {log_path}")
+
+
+def restart_chatgpt_app(start_if_closed: bool = False):
+    running = is_chatgpt_app_running()
+    if not running and not start_if_closed:
+        return {"ok": True, "app_ready": False, "method": "app_was_closed"}
+    env = _desktop_launch_environment()
+    _stop_chatgpt_app()
+    return _launch_chatgpt_and_wait(env)
+
+
+def switch_to_account(account_info: dict, restart_app: bool = True, start_app_if_closed: bool = False):
+    # Serialize the GUI and background watcher's account transitions.
+    CODEX_DIR.mkdir(parents=True, exist_ok=True)
+    with (CODEX_DIR / "account-switch.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("Another account switch is in progress. Wait for it to finish.")
+        src = Path(account_info["file_path"])
+        if not src.exists():
+            raise FileNotFoundError(f"Account file not found: {src}")
+        # Validate before stopping a healthy app; synchronize only after shutdown
+        # so its final save cannot overwrite the newly selected credentials.
+        json.loads(src.read_text(encoding="utf-8"))
+        launch = restart_app or start_app_if_closed
+        env = _desktop_launch_environment() if launch else None
+        if launch:
+            _stop_chatgpt_app()
+        sync_current_auth()
+        raw = src.read_text(encoding="utf-8")
+        tmp = CODEX_DIR / "auth.json.tmp"
+        tmp.write_text(raw, encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        tmp.replace(AUTH_FILE)
+        try:
+            result = _launch_chatgpt_and_wait(env) if launch else {"ok": True, "app_ready": False}
+        except Exception as exc:
+            raise RuntimeError(f"Account selected, but Codex could not open. {exc}") from exc
+        try:
+            subprocess.Popen(["notify-send", "-i", "chatgpt",
+                "Codex ready" if result["app_ready"] else "Codex account selected",
+                f"{account_info['email']} · " + ("App opened." if result["app_ready"] else "Restart disabled.")],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+        return result
+
+
+# ============================================================================
+# 2. CODEX AUTO-RESUME & IPC CONTINUATION
+# ============================================================================
+
+def _resolve_root_codex_thread(conn_state: sqlite3.Connection, thread_id: str) -> dict | None:
+    cur = conn_state.cursor()
+    visited = set()
+    curr_id = thread_id
+    last_row = None
+    while curr_id and curr_id not in visited:
+        visited.add(curr_id)
+        cur.execute(
+            "SELECT id, title, cwd, sandbox_policy, approval_mode, source, thread_source, updated_at "
+            "FROM threads WHERE id = ?",
+            (curr_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            break
+        last_row = row
+        t_source = row[6] or ""
+        raw_src = row[5] or ""
+        if t_source == "subagent" and raw_src.startswith("{"):
+            try:
+                sdata = json.loads(raw_src)
+                parent_id = ((sdata.get("subagent") or {}).get("thread_spawn") or {}).get("parent_thread_id")
+                if parent_id:
+                    curr_id = parent_id
+                    continue
+            except Exception:
+                pass
+        break
+
+    if not last_row:
+        return None
+    return {
+        "thread_id": last_row[0],
+        "title": (last_row[1] or "Untitled Codex chat").strip().splitlines()[0][:80],
+        "cwd": last_row[2] or str(Path.home()),
+        "sandbox_policy": last_row[3] or "",
+        "approval_mode": last_row[4] or "",
+        "thread_source": last_row[6] or "user",
+        "updated_at": last_row[7] or 0,
+    }
+
+
+def get_active_or_interrupted_codex_threads(
+    max_age_seconds: int = 3600,
+    include_recent_completed: bool = False,
+) -> list[dict]:
+    """Snapshot every unfinished root chat, using only its latest turn.
+
+    A long-running turn is fresh when its thread or rollout was updated recently.
+    Archived chats and finished parent chats are never resumed via old child turns.
+    """
+    hist_db = CODEX_DIR / "thread_history_1.sqlite"
+    state_db = CODEX_DIR / "state_5.sqlite"
+    if not state_db.exists():
+        return []
+    cutoff = int(time.time()) - max_age_seconds
+    candidates = []
+    try:
+        with closing(sqlite3.connect(state_db.as_uri() + "?mode=ro", uri=True, timeout=3)) as state:
+            turns = []
+            if hist_db.exists():
+                with closing(sqlite3.connect(hist_db.as_uri() + "?mode=ro", uri=True, timeout=3)) as hist:
+                    turns = hist.execute("""
+                        WITH latest AS (
+                            SELECT *, ROW_NUMBER() OVER (
+                                PARTITION BY thread_id ORDER BY rollout_ordinal DESC,
+                                COALESCE(completed_at, started_at, 0) DESC
+                            ) AS rn FROM thread_turns
+                        )
+                        SELECT thread_id, status, error_json, started_at, completed_at
+                        FROM latest WHERE rn = 1
+                        ORDER BY COALESCE(completed_at, started_at, 0) DESC
+                    """).fetchall()
+            roots = {}
+            for tid, status, error_json, started, completed in turns:
+                info = _resolve_root_codex_thread(state, tid)
+                if not info:
+                    continue
+                root_id = info["thread_id"]
+                root = state.execute(
+                    "SELECT archived, rollout_path FROM threads WHERE id = ?", (root_id,)
+                ).fetchone()
+                if not root or root[0] or info.get("thread_source") != "user":
+                    continue
+                ts = max(started or 0, completed or 0)
+                record = (info, status, error_json or "", ts, root[1], tid == root_id)
+                previous = roots.get(root_id)
+                # The root's own latest turn is authoritative over any child.
+                if previous is None or (record[5] and not previous[5]):
+                    roots[root_id] = record
+            for info, status, error, ts, rollout_path, _ in roots.values():
+                is_rl = any(term in error.lower() for term in ("usagelimitexceeded", "rate_limit", "quota"))
+                fresh = ts >= cutoff
+                if status == "inProgress":
+                    fresh = fresh or info.get("updated_at", 0) >= cutoff
+                    if not fresh and rollout_path:
+                        try:
+                            fresh = Path(rollout_path).stat().st_mtime >= cutoff
+                        except OSError:
+                            pass
+                unfinished = status in ("inProgress", "interrupted") or (status == "failed" and is_rl)
+                if fresh and (unfinished or include_recent_completed):
+                    priority = (0 if status == "inProgress" else 1 if is_rl else 2) if unfinished else 9
+                    info.update(status=status, is_rate_limit=is_rl, last_turn_ts=ts, priority=priority)
+                    candidates.append(info)
+            if not candidates and include_recent_completed:
+                row = state.execute(
+                    "SELECT id FROM threads WHERE archived = 0 AND thread_source = 'user' "
+                    "ORDER BY updated_at DESC LIMIT 1"
+                ).fetchone()
+                info = _resolve_root_codex_thread(state, row[0]) if row else None
+                if info:
+                    info.update(status="completed", is_rate_limit=False, priority=9, last_turn_ts=0)
+                    candidates.append(info)
+    except (sqlite3.Error, OSError):
+        return []
+    return sorted(candidates, key=lambda info: (info["priority"], -info["last_turn_ts"]))
+
+
+def get_active_or_interrupted_codex_thread(
+    max_age_seconds: int = 3600,
+    include_recent_completed: bool = False,
+) -> dict | None:
+    threads = get_active_or_interrupted_codex_threads(max_age_seconds, include_recent_completed)
+    return threads[0] if threads else None
+
+
+def resume_codex_threads(
+    threads: list[dict], prompt: str | None = None, wait_for_app_seconds: float = 18.0,
+) -> list[dict]:
+    """Continue each captured root once; a failed chat does not block the rest."""
+    results = []
+    seen = set()
+    for thread in threads:
+        tid = thread.get("thread_id")
+        if not tid or tid in seen:
+            continue
+        seen.add(tid)
+        try:
+            result = resume_codex_thread(
+                tid, prompt=prompt, cwd=thread.get("cwd"),
+                wait_for_app_seconds=wait_for_app_seconds,
+            )
+        except Exception as exc:
+            result = {"ok": False, "method": "desktop_error", "thread_id": tid, "error": str(exc)}
+        results.append(result)
+    return results
+
+
+def _ipc_send_frame(sock: socket.socket, obj: dict):
+    raw = json.dumps(obj).encode("utf-8")
+    sock.sendall(struct.pack("<I", len(raw)) + raw)
+
+
+def _ipc_recv_frame(sock: socket.socket, timeout: float = 3.0) -> dict | None:
+    sock.settimeout(timeout)
+    hdr = b""
+    while len(hdr) < 4:
+        chunk = sock.recv(4 - len(hdr))
+        if not chunk:
+            return None
+        hdr += chunk
+    length = struct.unpack("<I", hdr)[0]
+    if length > 8 * 1024 * 1024:
+        raise ValueError("IPC response too large")
+    body = b""
+    while len(body) < length:
+        chunk = sock.recv(length - len(body))
+        if not chunk:
+            return None
+        body += chunk
+    return json.loads(body.decode("utf-8", errors="ignore"))
+
+
+def _try_codex_ipc_start_turn(
+    thread_id: str, prompt: str, *, probe_only: bool = False
+) -> tuple[bool, str]:
+    ipc_sock_path = CODEX_DIR / "ipc" / "ipc.sock"
+    if not ipc_sock_path.exists():
+        return False, "ipc_sock_yok"
+    s = None
+    turn_sent = False
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(str(ipc_sock_path))
+        init_req_id = str(uuid.uuid4())
+        _ipc_send_frame(
+            s,
+            {
+                "type": "request",
+                "requestId": init_req_id,
+                "sourceClientId": "initializing-client",
+                "version": 1,
+                "method": "initialize",
+                "params": {"clientType": "cli"},
+            },
+        )
+        init_resp = _ipc_recv_frame(s, timeout=2.5)
+        if not init_resp or init_resp.get("resultType") != "success":
+            s.close()
+            return False, "ipc_init_basarisiz"
+        client_id = (init_resp.get("result") or {}).get("clientId")
+        if not client_id:
+            s.close()
+            return False, "ipc_client_id_yok"
+
+        disc_req_id = str(uuid.uuid4())
+        _ipc_send_frame(
+            s,
+            {
+                "type": "request",
+                "requestId": disc_req_id,
+                "sourceClientId": client_id,
+                "version": 1,
+                "method": "thread-owner-discovery",
+                "params": {"hostId": "local", "conversationId": thread_id},
+            },
+        )
+        owner_id = None
+        for _ in range(5):
+            msg = _ipc_recv_frame(s, timeout=2.0)
+            if not msg:
+                break
+            if msg.get("requestId") == disc_req_id and msg.get("type") == "response":
+                if msg.get("resultType") == "success":
+                    owner_id = msg.get("handledByClientId") or (
+                        (msg.get("result") or {}).get("ownerClientId")
+                    )
+                break
+        if not owner_id:
+            s.close()
+            return False, "ipc_owner_bulunamadi"
+        if probe_only:
+            return True, "ipc_desktop_owner_hazir"
+
+        turn_req_id = str(uuid.uuid4())
+        # Once sending starts, an absent acknowledgement must never cause a
+        # second turn or a separate writer to be launched for the same thread.
+        turn_sent = True
+        _ipc_send_frame(
+            s,
+            {
+                "type": "request",
+                "requestId": turn_req_id,
+                "sourceClientId": client_id,
+                "version": 2,
+                "method": "thread-follower-start-turn",
+                "targetClientId": owner_id,
+                "params": {
+                    "conversationId": thread_id,
+                    "turnStart": {
+                        "request": {
+                            "threadId": thread_id,
+                            "input": [{"type": "text", "text": prompt, "text_elements": []}],
+                        },
+                        "context": {"inheritThreadSettings": True},
+                    },
+                },
+            },
+        )
+        for _ in range(6):
+            msg = _ipc_recv_frame(s, timeout=3.0)
+            if not msg:
+                break
+            if msg.get("requestId") == turn_req_id and msg.get("type") == "response":
+                s.close()
+                if msg.get("resultType") == "success":
+                    return True, "ipc_desktop"
+                return False, f"ipc_hata:{msg.get('error')}"
+        s.close()
+        return False, "ipc_gonderim_belirsiz"
+    except Exception as e:
+        if turn_sent:
+            return False, "ipc_gonderim_belirsiz"
+        return False, f"ipc_istisna:{e}"
+    finally:
+        if s is not None:
+            s.close()
+
+
+def _open_codex_thread_in_desktop(thread_id: str):
+    # The installed app handles this URI and loads the thread in its own
+    # app-server, including the desktop tools and browser context.
+    thread_id = str(uuid.UUID(thread_id))
+    subprocess.Popen(
+        ["xdg-open", f"codex://threads/{thread_id}"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def resume_codex_thread(
+    thread_id: str,
+    prompt: str | None = None,
+    cwd: str | None = None,
+    wait_for_app_seconds: float = 15.0,
+) -> dict:
+    """
+    Continues a Codex thread automatically after an account switch.
+    Opens the saved thread in Desktop, waits for its IPC owner, then sends one
+    continuation request. It never creates a competing background CLI writer.
+    A missing acknowledgement is reported as unconfirmed and is not retried.
+    """
+    cfg = get_auto_config()
+    resume_text = (prompt or cfg.get("resume_prompt") or DEFAULT_AUTO_CONFIG["resume_prompt"]).strip()
+    deadline = time.monotonic() + max(1.0, wait_for_app_seconds)
+    last_reason = "bekleniyor"
+    opened_thread = False
+    while time.monotonic() < deadline:
+        if is_chatgpt_app_running():
+            ok, reason = _try_codex_ipc_start_turn(thread_id, resume_text)
+            last_reason = reason
+            if ok:
+                try:
+                    subprocess.Popen(
+                        [
+                            "notify-send",
+                            "-i",
+                            "chatgpt",
+                            "Codex chat resuming",
+                            f"Chat ({thread_id[:8]}...) resumed with the selected account.",
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception:
+                    pass
+                return {"ok": True, "method": reason, "thread_id": thread_id}
+            if reason == "ipc_gonderim_belirsiz" or reason.startswith("ipc_hata:"):
+                # Delivery may have succeeded even if the connection closed.
+                # Do not repeat the prompt or start a second owner.
+                return {
+                    "ok": False,
+                    "method": "desktop_unconfirmed" if reason == "ipc_gonderim_belirsiz" else "desktop_rejected",
+                    "thread_id": thread_id,
+                    "error": "Desktop continuation was not acknowledged; it was not sent again.",
+                    "ipc_reason": reason,
+                }
+            if reason == "ipc_owner_bulunamadi" and not opened_thread:
+                try:
+                    _open_codex_thread_in_desktop(thread_id)
+                    opened_thread = True
+                    # A freshly restarted app may need time to load the saved
+                    # thread and reclaim its writer lease.
+                    deadline = max(deadline, time.monotonic() + 45.0)
+                except Exception as e:
+                    last_reason = f"desktop_acilamadi:{e}"
+        time.sleep(1.2)
+
+    try:
+        subprocess.Popen(
+            [
+                "notify-send", "-i", "chatgpt",
+                "Codex continuation pending",
+                "Account changed, but the desktop chat could not resume. Open the chat and try again.",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+    return {
+        "ok": False,
+        "method": "desktop_pending",
+        "thread_id": thread_id,
+        "error": "Desktop chat connection was not ready; continuation was not sent.",
+        "ipc_reason": last_reason,
+    }
+
+
+# ============================================================================
+# ============================================================================
+
+
+# ============================================================================
+# 4. BROWSER & OAUTH HELPERS
+# ============================================================================
+
+def add_prompt_login(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+        q = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        if "accounts.google.com" not in parsed.netloc:
+            q["prompt"] = "login"
+        new_query = urlencode(q)
+        return urlunparse(parsed._replace(query=new_query))
+    except Exception:
+        return url
+
+
+def open_url_in_browser(url: str, private: bool = True):
+    login_url = add_prompt_login(url)
+    if private:
+        for cmd, flag in [
+            ("zen-browser", "--private-window"),
+            ("firefox", "--private-window"),
+            ("chromium", "--incognito"),
+            ("google-chrome", "--incognito"),
+            ("brave", "--incognito"),
+        ]:
+            if shutil.which(cmd):
+                subprocess.Popen(
+                    [cmd, flag, login_url],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                return
+    subprocess.Popen(
+        ["xdg-open", login_url],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+
+
+
+
+# ============================================================================
+# 5. SYSTEMD SERVICE HELPERS (codex-auto-switch.service)
+# ============================================================================
+
+def get_auto_service_status() -> dict:
+    try:
+        res = subprocess.run(
+            ["systemctl", "--user", "is-active", "codex-auto-switch.service"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        active = res.stdout.strip() == "active"
+        en_res = subprocess.run(
+            ["systemctl", "--user", "is-enabled", "codex-auto-switch.service"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        enabled = en_res.stdout.strip() == "enabled"
+        return {"active": active, "enabled": enabled, "state": res.stdout.strip()}
+    except Exception as e:
+        return {"active": False, "enabled": False, "state": str(e)}
+
+
+def set_auto_service_enabled(enable: bool) -> tuple[bool, str]:
+    try:
+        subprocess.run(["systemctl", "--user", "daemon-reload"], timeout=4)
+        action = "enable" if enable else "disable"
+        res = subprocess.run(
+            ["systemctl", "--user", action, "--now", "codex-auto-switch.service"],
+            capture_output=True,
+            text=True,
+            timeout=6,
+        )
+        if res.returncode == 0:
+            return True, "Service started and enabled." if enable else "Service stopped."
+        return False, res.stderr.strip() or "systemctl error"
+    except Exception as e:
+        return False, str(e)
+
+
+def restart_auto_service_if_active():
+    st = get_auto_service_status()
+    if st.get("active"):
+        try:
+            subprocess.run(["systemctl", "--user", "restart", "codex-auto-switch.service"], timeout=5)
+        except Exception:
+            pass
+
+
+def get_recent_auto_service_logs(lines: int = 18) -> str:
+    try:
+        res = subprocess.run(
+            ["journalctl", "--user", "-u", "codex-auto-switch.service", "-n", str(lines), "--no-pager", "-o", "cat"],
+            capture_output=True,
+            text=True,
+            timeout=4,
+        )
+        out = res.stdout.strip()
+        return out if out else "No activity yet."
+    except Exception as e:
+        return f"Could not read log: {e}"
+
+
+# ============================================================================
+# 6. GTK4 / LIBADWAITA UNIFIED CONTROL CENTER GUI
+# ============================================================================
+
+
+
+
+
+
+def run_gui():
+    import gi
+
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, Gdk, GLib, Gtk, Pango
+
+    css_provider = Gtk.CssProvider()
+    css_provider.load_from_data(b"""
+        @define-color window_bg_color #0d1210;
+        @define-color window_fg_color #dce8df;
+        @define-color view_bg_color #101713;
+        @define-color view_fg_color #dce8df;
+        @define-color headerbar_bg_color #0d1210;
+        @define-color headerbar_fg_color #dce8df;
+        @define-color card_bg_color #161e19;
+        @define-color card_fg_color #dce8df;
+        @define-color popover_bg_color #1b271f;
+        @define-color popover_fg_color #dce8df;
+        @define-color dialog_bg_color #161e19;
+        @define-color dialog_fg_color #dce8df;
+        @define-color accent_bg_color #8ac89c;
+        @define-color accent_fg_color #102317;
+        @define-color accent_color #9bd6ac;
+        @define-color secondary_text #a4b5a8;
+        @define-color plus_surface #193625;
+        @define-color plus_text #e2f7e8;
+        @define-color plus_accent #9bd6ac;
+        @define-color success_surface #233b2a;
+        @define-color success_text #afd8b9;
+        @define-color warning_surface #3c3423;
+        @define-color warning_text #e7c687;
+        @define-color error_surface #3e2729;
+        @define-color error_text #eab2b6;
+        window.account-switcher { background: @window_bg_color; color: @window_fg_color; }
+        .account-switcher headerbar { background: @headerbar_bg_color; box-shadow: none; }
+        .account-switcher .dim-label { opacity: 1; color: @secondary_text; }
+        .account-switcher .subtitle { opacity: 1; color: @secondary_text; }
+        .account-switcher preferencesgroup > box > label { color: @secondary_text; }
+        .account-switcher .page-intro { margin-bottom: 8px; }
+        .account-switcher .page-intro .title-1 { font-size: 29px; font-weight: 700; }
+        .account-switcher .page-intro .dim-label { font-size: 14px; }
+        .account-switcher .matrix-sidebar {
+            background: #101713; border-right: 1px solid #26332b; padding: 22px 14px 18px;
+        }
+        .account-switcher .brand-name { font-size: 19px; font-weight: 700; }
+        .account-switcher .brand-symbol { color: @accent_color; }
+        .account-switcher .nav-button { border-radius: 9px; padding: 10px 12px; background: transparent; box-shadow: none; }
+        .account-switcher .nav-button:hover { background: #1b271f; }
+        .account-switcher .nav-button:checked { background: #263e2e; color: #d6efdd; }
+        .account-switcher .sidebar-status { padding: 12px 2px 0; border-top: 1px solid #26332b; }
+        .account-switcher .account-list list.boxed-list { background: transparent; box-shadow: none; }
+        .account-switcher row.account-entry {
+            background: @card_bg_color; border: 1px solid #2a382e;
+            border-radius: 14px; margin-bottom: 12px; box-shadow: none;
+        }
+        .account-switcher row.account-current { background: #18291e; border-color: #527b5d; }
+        .account-switcher .identity-name { font-size: 16px; font-weight: 700; }
+        .account-switcher avatar { background: #2a3b2e; color: #bbd6c2; }
+        .account-switcher .quota-number { font-family: monospace; font-size: 22px; font-weight: 600; }
+        .account-switcher .quota-block { padding: 4px 0 6px; }
+        .account-switcher .account-actions { margin-top: 2px; }
+        .account-switcher .account-actions button { padding: 5px 12px; }
+        .account-switcher .limit-box { padding: 12px; border-radius: 10px; background: @view_bg_color; }
+        .account-switcher .badge-ok, .account-switcher .badge-warn,
+        .account-switcher .badge-err, .account-switcher .badge-active,
+        .account-switcher .badge-model, .account-switcher .badge-plus,
+        .account-switcher .badge-neutral {
+            padding: 4px 8px; border-radius: 5px; font-weight: 600; font-size: 11px;
+        }
+        .account-switcher .badge-ok { background: @success_surface; color: @success_text; }
+        .account-switcher .badge-warn { background: @warning_surface; color: @warning_text; }
+        .account-switcher .badge-err { background: @error_surface; color: @error_text; }
+        .account-switcher .badge-active { background: #385a41; color: #e0f5e5; }
+        .account-switcher .badge-model, .account-switcher .badge-neutral { background: #2b3730; color: #c4d5c9; }
+        .account-switcher .badge-pro { background: #cab5e5; color: #261b36; padding: 4px 8px; border-radius: 5px; font-weight: 600; font-size: 11px; }
+        .account-switcher .badge-plus { background: @plus_accent; color: #132b1a; }
+        .account-switcher button { min-height: 28px; border-radius: 8px; }
+        .account-switcher button.suggested-action { font-weight: 700; }
+        .account-switcher button:focus-visible { outline: 2px solid #9bd6ac; outline-offset: 2px; }
+        .account-switcher progressbar trough { min-height: 4px; background: #354238; }
+        .account-switcher progressbar progress { min-height: 4px; border-radius: 4px; }
+        .account-switcher progressbar.bar-ok progress { background: #8ac89c; }
+        .account-switcher progressbar.bar-warn progress { background: #d4b779; }
+        .account-switcher progressbar.bar-err progress { background: #d5979e; }
+        .account-switcher .switch-status { background: #26372c; padding: 12px 16px; border-radius: 10px; }
+        .account-switcher .switch-status.error { background: @error_surface; color: @error_text; }
+        .account-switcher .log-view { font-family: monospace; font-size: 12px; padding: 14px; border-radius: 10px; background: @view_bg_color; color: @secondary_text; }
+    """)
+    Gtk.StyleContext.add_provider_for_display(
+        Gdk.Display.get_default(),
+        css_provider,
+        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+    )
+
+    class UnifiedAccountSwitcherApp(Adw.Application):
+        def __init__(self):
+            super().__init__(application_id="io.local.CodexAccountCenter")
+            self.login_proc = None
+            self.backup_auth_bytes = None
+            self.last_oauth_url = None
+            self.limits_cache: dict[str, dict] = {}
+            self.fetching_limits = False
+
+
+        def do_activate(self):
+            style_manager = Adw.StyleManager.get_default()
+            style_manager.set_color_scheme(Adw.ColorScheme.PREFER_DARK)
+
+            win = self.props.active_window
+            if not win:
+                win = Adw.ApplicationWindow(application=self)
+                win.set_title("Account Center")
+                win.add_css_class("account-switcher")
+                win.set_default_size(1120, 860)
+                win.set_size_request(620, 500)
+                self.win = win
+                self.build_ui()
+            win.present()
+
+        def build_ui(self):
+            self.toast_overlay = Adw.ToastOverlay()
+            self.win.set_content(self.toast_overlay)
+
+            toolbar_view = Adw.ToolbarView()
+            self.toast_overlay.set_child(toolbar_view)
+
+            header = Adw.HeaderBar()
+
+            self.view_stack = Adw.ViewStack()
+            self.view_stack.set_hexpand(True)
+            self.view_stack.set_vexpand(True)
+            self.compact_nav = Gtk.Box(spacing=4)
+            self.compact_nav.set_visible(False)
+            header.set_title_widget(self.compact_nav)
+            brand = Gtk.Label(label="Account Center")
+            brand.add_css_class("heading")
+            header.pack_start(brand)
+            self.refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic")
+            self.refresh_btn.set_tooltip_text("Refresh accounts and plans")
+            self.refresh_btn.connect("clicked", lambda *_: self.refresh_all(fetch_limits=True))
+            header.pack_end(self.refresh_btn)
+            self.header_spinner = Gtk.Spinner()
+            header.pack_end(self.header_spinner)
+            toolbar_view.add_top_bar(header)
+
+            shell = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+            self.sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            self.sidebar.set_size_request(196, -1)
+            self.sidebar.set_hexpand(False)
+            self.sidebar.add_css_class("matrix-sidebar")
+            mark = Gtk.Image.new_from_icon_name("utilities-terminal-symbolic")
+            mark.set_pixel_size(30)
+            mark.set_halign(Gtk.Align.START)
+            mark.add_css_class("brand-symbol")
+            self.sidebar.append(mark)
+            name = Gtk.Label(label="Account\nCenter", xalign=0)
+            name.add_css_class("brand-name")
+            self.sidebar.append(name)
+            description = Gtk.Label(label="Your personal control room.", xalign=0)
+            description.add_css_class("dim-label")
+            description.add_css_class("caption")
+            description.set_margin_bottom(28)
+            self.sidebar.append(description)
+            self.nav_buttons = {}
+            for page_name, label, icon in (("codex", "Codex", "applications-system-symbolic"),
+                                           ("automation", "Automation", "emblem-system-symbolic")):
+                button = Gtk.ToggleButton()
+                button.add_css_class("nav-button")
+                content = Gtk.Box(spacing=10)
+                content.append(Gtk.Image.new_from_icon_name(icon))
+                content.append(Gtk.Label(label=label, xalign=0, hexpand=True))
+                button.set_child(content)
+                button.connect("clicked", lambda _b, n=page_name: self.navigate(n))
+                self.sidebar.append(button)
+                compact = Gtk.Button(icon_name=icon)
+                compact.set_tooltip_text(label)
+                compact.connect("clicked", lambda _b, n=page_name: self.navigate(n))
+                self.compact_nav.append(compact)
+                self.nav_buttons[page_name] = button
+            spacer = Gtk.Box(vexpand=True)
+            self.sidebar.append(spacer)
+            self.sidebar_status = Gtk.Label(label="Checking monitor…", xalign=0, wrap=True)
+            self.sidebar_status.add_css_class("caption")
+            self.sidebar_status.add_css_class("dim-label")
+            self.sidebar_status.add_css_class("sidebar-status")
+            self.sidebar.append(self.sidebar_status)
+            shell.append(self.sidebar)
+            shell.append(self.view_stack)
+            toolbar_view.set_content(shell)
+            self.build_codex_tab()
+            self.build_automation_tab()
+            if hasattr(Adw, "Breakpoint"):
+                breakpoint = Adw.Breakpoint.new(Adw.BreakpointCondition.parse("max-width: 850px"))
+                breakpoint.add_setter(self.sidebar, "visible", False)
+                breakpoint.add_setter(self.compact_nav, "visible", True)
+                self.win.add_breakpoint(breakpoint)
+            self.navigate("codex")
+
+            self.refresh_all(fetch_limits=True)
+
+        def refresh_all(self, fetch_limits: bool = False):
+            self.refresh_list(fetch_limits=fetch_limits)
+            self.refresh_automation_status()
+            self.sidebar_status.set_text("Monitor running" if get_auto_service_status().get("active", False) else "Monitor stopped")
+
+        # ---------------- TAB 1: CODEX (CHATGPT) ---------------- #
+        def build_codex_tab(self):
+            scrolled = Gtk.ScrolledWindow()
+            scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scrolled.set_vexpand(True)
+
+            clamp = Adw.Clamp()
+            clamp.set_maximum_size(860)
+            clamp.set_margin_top(30)
+            clamp.set_margin_bottom(24)
+            clamp.set_margin_start(30)
+            clamp.set_margin_end(30)
+            scrolled.set_child(clamp)
+
+            self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
+            clamp.set_child(self.main_box)
+
+            self.main_box.append(self.make_intro("Your Codex accounts", "Check your usage. Choose an account. Keep working."))
+            self.account_summary = Gtk.Label(xalign=0, wrap=True)
+            self.account_summary.add_css_class("dim-label")
+            self.main_box.append(self.account_summary)
+            self.switch_status = Gtk.Label(xalign=0, wrap=True, visible=False)
+            self.switch_status.add_css_class("switch-status")
+            self.main_box.append(self.switch_status)
+
+            # 1. Options & Active Task Continuation group
+            options_group = Adw.PreferencesGroup()
+            options_group.set_title("Switch and resume")
+
+            self.restart_switch_row = Adw.SwitchRow()
+            self.restart_switch_row.set_title("Restart Codex when switching")
+            self.restart_switch_row.set_subtitle(
+                "Restart the desktop app with the selected account"
+            )
+            self.restart_switch_row.set_active(True)
+            options_expander = Adw.ExpanderRow(title="Switching settings", subtitle="Restart and resume")
+            options_expander.add_row(self.restart_switch_row)
+
+            self.codex_resume_switch_row = Adw.SwitchRow()
+            self.codex_resume_switch_row.set_title("Resume unfinished chats")
+            self.codex_resume_switch_row.set_subtitle(
+                "Resume each active or rate-limited chat after switching accounts"
+            )
+            self.codex_resume_switch_row.set_active(get_auto_config().get("codex_auto_resume", True))
+            self.codex_resume_switch_row.connect("notify::active", self.on_codex_resume_toggled)
+            options_expander.add_row(self.codex_resume_switch_row)
+            options_group.add(options_expander)
+
+            self.codex_active_task_row = Adw.ActionRow()
+            self.codex_active_task_row.set_title("Latest Codex chat")
+            self.codex_active_task_row.set_subtitle("Checking...")
+            resume_now_btn = Gtk.Button(label="Resume now")
+            resume_now_btn.set_valign(Gtk.Align.CENTER)
+            resume_now_btn.add_css_class("suggested-action")
+            resume_now_btn.connect("clicked", self.on_manual_codex_resume)
+            self.codex_active_task_row.add_suffix(resume_now_btn)
+            options_group.add(self.codex_active_task_row)
+
+
+            # 2. Accounts & Live Limits group
+            self.accounts_group = Adw.PreferencesGroup()
+            self.accounts_group.add_css_class("account-list")
+
+            self.main_box.append(self.accounts_group)
+            self.account_rows = []
+
+            # 3. Login / Add new account banner
+            self.login_status_group = Adw.PreferencesGroup()
+            self.login_status_group.set_title("Waiting for Codex sign-in...")
+            self.login_status_group.set_visible(False)
+
+            login_info_row = Adw.ActionRow()
+            login_info_row.set_title("Sign in to your new ChatGPT account in the browser")
+            login_info_row.set_subtitle(
+                "The account will be saved and usage loaded when sign-in completes."
+            )
+            spinner = Gtk.Spinner()
+            spinner.start()
+            login_info_row.add_prefix(spinner)
+            self.login_status_group.add(login_info_row)
+
+            login_actions_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            login_actions_box.set_margin_top(8)
+            login_actions_box.set_halign(Gtk.Align.CENTER)
+
+            reopen_priv_btn = Gtk.Button(label="Reopen private window")
+            reopen_priv_btn.connect(
+                "clicked",
+                lambda *_: self.last_oauth_url and open_url_in_browser(self.last_oauth_url, private=True),
+            )
+            login_actions_box.append(reopen_priv_btn)
+
+            copy_url_btn = Gtk.Button(label="Copy sign-in link")
+            copy_url_btn.connect("clicked", self.on_copy_login_url)
+            login_actions_box.append(copy_url_btn)
+
+            cancel_login_btn = Gtk.Button(label="Cancel")
+            cancel_login_btn.add_css_class("destructive-action")
+            cancel_login_btn.connect("clicked", lambda *_: self.cancel_login_flow())
+            login_actions_box.append(cancel_login_btn)
+
+            self.login_status_group.add(login_actions_box)
+            self.main_box.append(self.login_status_group)
+
+            # 4. Bottom action buttons (Codex OAuth)
+            btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            btn_box.set_halign(Gtk.Align.START)
+            btn_box.set_margin_top(6)
+
+            self.add_priv_btn = Gtk.Button(label="Add account")
+            self.add_priv_btn.set_tooltip_text("Sign in to a new Codex account in a private browser")
+            self.add_priv_btn.add_css_class("suggested-action")
+            self.add_priv_btn.connect("clicked", lambda *_: self.start_login_flow(private=True))
+            btn_box.append(self.add_priv_btn)
+
+            self.add_norm_btn = Gtk.Button(label="Standard sign-in")
+            self.add_norm_btn.connect("clicked", lambda *_: self.start_login_flow(private=False))
+            btn_box.append(self.add_norm_btn)
+
+            btn_box.set_halign(Gtk.Align.START)
+            self.main_box.insert_child_after(btn_box, self.switch_status)
+
+            self.main_box.append(options_group)
+            page = self.view_stack.add_titled(scrolled, "codex", "Codex")
+            page.set_icon_name("applications-system-symbolic")
+
+
+        def build_automation_tab(self):
+            scrolled = Gtk.ScrolledWindow()
+            scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scrolled.set_vexpand(True)
+
+            clamp = Adw.Clamp()
+            clamp.set_maximum_size(860)
+            clamp.set_margin_top(30)
+            clamp.set_margin_bottom(24)
+            clamp.set_margin_start(30)
+            clamp.set_margin_end(30)
+            scrolled.set_child(clamp)
+
+            auto_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
+            clamp.set_child(auto_box)
+
+            cfg = get_auto_config()
+            auto_box.append(self.make_intro("Automation", "Set the switching threshold and continuation message for unfinished work."))
+
+            # 1. Background Watcher Service Group
+            svc_group = Adw.PreferencesGroup()
+            svc_group.set_title("Background monitoring")
+            svc_group.set_description(
+                "When enabled, this service monitors Codex usage in the background, "
+                "switches accounts at the selected threshold, and resumes unfinished chats."
+            )
+
+            self.svc_status_row = Adw.ActionRow()
+            self.svc_status_row.set_title("Automatic account switching")
+            self.svc_status_row.set_subtitle("Checking status...")
+
+            svc_btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            svc_btn_box.set_valign(Gtk.Align.CENTER)
+
+            self.svc_toggle_btn = Gtk.Button(label="Start service")
+            self.svc_toggle_btn.add_css_class("suggested-action")
+            self.svc_toggle_btn.connect("clicked", self.on_toggle_auto_service)
+            svc_btn_box.append(self.svc_toggle_btn)
+
+            self.svc_status_row.add_suffix(svc_btn_box)
+            svc_group.add(self.svc_status_row)
+            auto_box.append(svc_group)
+
+            # 2. Threshold & Rules Group
+            rules_group = Adw.PreferencesGroup()
+            rules_group.set_title("Switching rules")
+
+            self.auto_codex_sw = Adw.SwitchRow()
+            self.auto_codex_sw.set_title("Automatically switch Codex accounts")
+            self.auto_codex_sw.set_subtitle("Switch to an available account when five-hour or weekly usage reaches the threshold")
+            self.auto_codex_sw.set_active(cfg.get("codex_auto_switch", True))
+            rules_group.add(self.auto_codex_sw)
+
+            self.codex_thresh_row = Adw.SpinRow.new_with_range(1, 20, 1)
+            self.codex_thresh_row.set_title("Remaining usage threshold (%)")
+            self.codex_thresh_row.set_subtitle("For example, 2 switches when 2% or less remains, or when usage is exhausted")
+            self.codex_thresh_row.set_value(float(cfg.get("codex_threshold", 2)))
+            rules_group.add(self.codex_thresh_row)
+
+            self.interval_row = Adw.SpinRow.new_with_range(15, 300, 5)
+            self.interval_row.set_title("Check interval (seconds)")
+            self.interval_row.set_subtitle("Seconds between usage checks (recommended: 30)")
+            self.interval_row.set_value(float(cfg.get("check_interval", 30)))
+            rules_group.add(self.interval_row)
+
+            auto_box.append(rules_group)
+
+            # 3. Continuation Prompt Group
+            prompt_group = Adw.PreferencesGroup()
+            prompt_group.set_title("Continuation message")
+            prompt_group.set_description(
+                "Message sent to unfinished chats after the account changes and the app reopens:"
+            )
+
+            self.prompt_entry_row = Adw.EntryRow()
+            self.prompt_entry_row.set_title("Continuation message")
+            self.prompt_entry_row.set_text(cfg.get("resume_prompt") or DEFAULT_AUTO_CONFIG["resume_prompt"])
+            prompt_group.add(self.prompt_entry_row)
+
+            save_cfg_btn = Gtk.Button(label="Save settings")
+            save_cfg_btn.add_css_class("suggested-action")
+            save_cfg_btn.add_css_class("pill")
+            save_cfg_btn.set_halign(Gtk.Align.CENTER)
+            save_cfg_btn.set_margin_top(10)
+            save_cfg_btn.connect("clicked", self.on_save_auto_config_clicked)
+            prompt_group.add(save_cfg_btn)
+
+            auto_box.append(prompt_group)
+
+            # 4. Live Service Logs Group
+            log_group = Adw.PreferencesGroup()
+            log_group.set_title("Recent activity")
+
+            self.log_label = Gtk.Label(label="Loading...")
+            self.log_label.set_selectable(True)
+            self.log_label.set_wrap(True)
+            self.log_label.set_halign(Gtk.Align.START)
+            self.log_label.add_css_class("log-view")
+            log_group.add(self.log_label)
+
+            auto_box.append(log_group)
+
+            page = self.view_stack.add_titled(scrolled, "automation", "Automation")
+            page.set_icon_name("emblem-system-symbolic")
+
+        def show_toast(self, msg: str):
+            toast = Adw.Toast.new(msg)
+            toast.set_timeout(3)
+            self.toast_overlay.add_toast(toast)
+
+        def make_intro(self, title, subtitle):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            box.add_css_class("page-intro")
+            heading = Gtk.Label(label=title, xalign=0)
+            heading.add_css_class("title-1")
+            box.append(heading)
+            detail = Gtk.Label(label=subtitle, xalign=0, wrap=True)
+            detail.add_css_class("dim-label")
+            box.append(detail)
+            return box
+
+        def make_flow_box(self):
+            if hasattr(Adw, "WrapBox"):
+                return Adw.WrapBox(child_spacing=6, line_spacing=6)
+            flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE)
+            flow.set_min_children_per_line(1)
+            flow.set_max_children_per_line(8)
+            flow.set_column_spacing(6)
+            flow.set_row_spacing(6)
+            flow.set_homogeneous(False)
+            flow.set_halign(Gtk.Align.START)
+            return flow
+
+        def navigate(self, name):
+            self.view_stack.set_visible_child_name(name)
+            for key, button in self.nav_buttons.items():
+                button.set_active(key == name)
+
+
+
+
+
+        def make_limit_bar_row(self, title: str, rem_pct: int, reset_str: str, note: str = "") -> Gtk.Box:
+            row_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+
+            top_line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            lbl_left = Gtk.Label(label=title)
+            lbl_left.set_halign(Gtk.Align.START)
+            lbl_left.set_hexpand(False)
+            lbl_left.add_css_class("caption")
+            top_line.append(lbl_left)
+
+            right_txt = f"{rem_pct}% remaining"
+            if reset_str and rem_pct < 100:
+                right_txt += f"  •  Resets: {reset_str}"
+            elif note:
+                right_txt += f"  •  {note}"
+            lbl_right = Gtk.Label(label=right_txt, wrap=True, xalign=1)
+            lbl_right.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            lbl_right.set_hexpand(True)
+            lbl_right.set_halign(Gtk.Align.END)
+            lbl_right.add_css_class("caption-heading")
+            top_line.append(lbl_right)
+
+            pbar = Gtk.ProgressBar()
+            pbar.set_fraction(max(0.0, min(1.0, rem_pct / 100.0)))
+            if rem_pct <= 2:
+                pbar.add_css_class("bar-err")
+            elif rem_pct <= 25:
+                pbar.add_css_class("bar-warn")
+            else:
+                pbar.add_css_class("bar-ok")
+
+            row_box.append(top_line)
+            row_box.append(pbar)
+            return row_box
+
+        # ---------------- CODEX CARD & HANDLERS ---------------- #
+        def build_account_card(self, acc: dict) -> Gtk.Widget:
+            row = Gtk.ListBoxRow(activatable=False, selectable=False)
+            row.add_css_class("account-entry")
+            if acc["is_active"]:
+                row.add_css_class("account-current")
+            card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+            for side in ("top", "bottom", "start", "end"):
+                getattr(card, "set_margin_" + side)(18)
+            row.set_child(card)
+            identity = Gtk.Box(spacing=12)
+            name = acc.get("name") or acc["email"].split("@")[0]
+            avatar = Adw.Avatar.new(38, name, True)
+            avatar.set_valign(Gtk.Align.START)
+            identity.append(avatar)
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3, hexpand=True)
+            title = Gtk.Label(label=name, xalign=0, wrap=True)
+            title.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            title.add_css_class("identity-name")
+            text.append(title)
+            email = Gtk.Label(label=acc["email"], xalign=0, ellipsize=Pango.EllipsizeMode.MIDDLE)
+            email.set_tooltip_text(acc["email"])
+            email.add_css_class("dim-label")
+            email.add_css_class("caption")
+            text.append(email)
+            identity.append(text)
+            lim = self.limits_cache.get(acc["id_key"])
+            plan = str((lim or {}).get("plan_type") or "").upper()
+            plan_badge = Gtk.Label(label=plan or "UNKNOWN PLAN", valign=Gtk.Align.START)
+            plan_badge.add_css_class("badge-pro" if plan.startswith("PRO") else "badge-plus" if plan == "PLUS" else "badge-neutral")
+            plan_badge.set_tooltip_text("Current plan reported by the service" if plan else "Plan has not been verified")
+            identity.append(plan_badge)
+            if acc["is_active"]:
+                status, css = "ACTIVE", "badge-active"
+            elif lim and lim.get("ok"):
+                rem = min(lim.get("rem_5h", 100), lim.get("rem_weekly", 100))
+                status, css = ("LIMIT REACHED", "badge-err") if rem <= 0 or lim.get("limit_reached") else (("LOW USAGE", "badge-warn") if rem <= 25 else ("READY", "badge-ok"))
+            else:
+                status, css = "CHECKING", "badge-neutral"
+            badge = Gtk.Label(label=status, valign=Gtk.Align.START)
+            badge.add_css_class(css)
+            identity.append(badge)
+            card.append(identity)
+            if lim and lim.get("ok"):
+                quotas = Gtk.Box(spacing=24, homogeneous=True)
+                for label, pct, reset in (("5-hour", lim["rem_5h"], lim.get("reset_5h", "")),
+                                           ("Weekly", lim["rem_weekly"], lim.get("reset_weekly", ""))):
+                    column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5, hexpand=True)
+                    column.add_css_class("quota-block")
+                    heading = Gtk.Box(spacing=8)
+                    caption = Gtk.Label(label=label, xalign=0, hexpand=True)
+                    caption.add_css_class("dim-label")
+                    heading.append(caption)
+                    reported = lim.get("has_5h_cap" if label == "5-hour" else "has_weekly_cap", True)
+                    number = Gtk.Label(label=f"{pct}%" if reported else "—")
+                    number.add_css_class("quota-number")
+                    heading.append(number)
+                    column.append(heading)
+                    bar = Gtk.ProgressBar(fraction=max(0,min(1,pct/100)) if reported else 0)
+                    bar.add_css_class("bar-err" if pct <= 2 else "bar-warn" if pct <= 25 else "bar-ok")
+                    column.append(bar)
+                    reset_label = Gtk.Label(label=(f"{reset} until renewal" if reset and pct < 100 else "Ready to use") if reported else "No window reported", xalign=0, wrap=True)
+                    reset_label.add_css_class("caption")
+                    reset_label.add_css_class("dim-label")
+                    column.append(reset_label)
+                    quotas.append(column)
+                card.append(quotas)
+            else:
+                label = Gtk.Label(label=("Loading usage…" if lim is None else f"Usage unavailable · {lim.get('error', '')}"), xalign=0, wrap=True)
+                label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+                label.add_css_class("dim-label")
+                card.append(label)
+            actions = self.make_flow_box()
+            actions.add_css_class("account-actions")
+            switch = Gtk.Button(label="Restart Codex" if acc["is_active"] and is_chatgpt_app_running() else "Open Codex" if acc["is_active"] else "Switch to this account")
+            switch.connect("clicked", lambda _b, a=acc: self.on_switch_clicked(a, force_start=a["is_active"]))
+            actions.append(switch)
+            if lim and lim.get("ok") and lim.get("reset_available", 0) > 0:
+                reset = Gtk.Button(label=f"Use reset credit ({lim['reset_available']})")
+                reset.connect("clicked", lambda _b, a=acc, cid=lim.get("reset_credit_id"): self.on_use_reset_credit(a, cid))
+                actions.append(reset)
+            more = Gtk.MenuButton(icon_name="view-more-symbolic")
+            more.set_tooltip_text("Subscription, reset details, and account removal")
+            popover = Gtk.Popover()
+            details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+            for side in ("top", "bottom", "start", "end"):
+                getattr(details, "set_margin_" + side)(10)
+            plan = (lim or {}).get("plan_type") or "Unknown"
+            lines = [f"Plan: {plan}"]
+            if acc.get("sub_until"):
+                lines.append(f"Subscription ends: {acc['sub_until']}")
+            if lim and lim.get("ok"):
+                lines.extend([f"Reset credits: {lim.get('reset_available', 0)}", f"Granted in the last 30 days: {lim.get('granted_30d_count', 0)}"])
+                for key, title in (("reset_expires", "Reset expiry"), ("last_granted_str", "Last granted"), ("last_used_str", "Last used")):
+                    if lim.get(key):
+                        lines.append(f"{title}: {lim[key]}")
+                if lim.get("has_credits"):
+                    lines.append(f"Additional credits: {lim.get('credits_balance', '0')}")
+            info = Gtk.Label(label="\n".join(lines), xalign=0, wrap=True, selectable=True)
+            details.append(info)
+            delete = Gtk.Button(label="Remove saved account")
+            delete.add_css_class("destructive-action")
+            delete.connect("clicked", lambda _b, a=acc: self.on_delete_clicked(a))
+            details.append(delete)
+            popover.set_child(details)
+            more.set_popover(popover)
+            actions.append(more)
+            card.append(actions)
+            return row
+
+        def refresh_list(self, fetch_limits: bool = False):
+            accounts, _ = list_accounts()
+            ready = sum(1 for a in accounts if (self.limits_cache.get(a["id_key"]) or {}).get("ok") and min(self.limits_cache[a["id_key"]].get("rem_5h", 0), self.limits_cache[a["id_key"]].get("rem_weekly", 0)) > get_auto_config().get("codex_threshold", 2))
+            self.account_summary.set_text(f"{len(accounts)} saved accounts  ·  {ready} available  ·  Refreshing usage" if fetch_limits else f"{len(accounts)} saved accounts  ·  {ready} available")
+
+            t_info = get_active_or_interrupted_codex_thread(max_age_seconds=86400, include_recent_completed=True)
+            if t_info:
+                st_map = {
+                    "inProgress": "⚡ Running",
+                    "interrupted": "⏸ Interrupted",
+                    "failed": "🛑 Rate limited" if t_info.get("is_rate_limit") else "⚠ Failed",
+                    "completed": "✓ Latest chat",
+                }
+                st_txt = st_map.get(t_info.get("status", ""), t_info.get("status", ""))
+                self.codex_active_task_row.set_subtitle(
+                    f"{st_txt}: \"{t_info['title']}\" ({t_info['thread_id'][:8]}...)"
+                )
+            else:
+                self.codex_active_task_row.set_subtitle("No active or interrupted Codex chat found")
+
+            for r in self.account_rows:
+                self.accounts_group.remove(r)
+            self.account_rows.clear()
+
+            if not accounts:
+                empty_row = Adw.ActionRow()
+                empty_row.set_title("No saved accounts")
+                empty_row.set_subtitle("Choose Add account to save your first account")
+                self.accounts_group.add(empty_row)
+                self.account_rows.append(empty_row)
+            else:
+                for acc in accounts:
+                    row = self.build_account_card(acc)
+                    self.accounts_group.add(row)
+                    self.account_rows.append(row)
+
+            if fetch_limits and not self.fetching_limits and accounts:
+                self.fetching_limits = True
+                self.header_spinner.start()
+
+                def worker(accs_snapshot):
+                    res = fetch_all_limits_parallel(accs_snapshot)
+                    GLib.idle_add(self.on_limits_fetched, res)
+
+                threading.Thread(target=worker, args=(accounts,), daemon=True).start()
+
+
+
+        # ---------------- AUTOMATION & RESUME HANDLERS ---------------- #
+        def on_codex_resume_toggled(self, switch_row, _pspec):
+            save_auto_config({"codex_auto_resume": switch_row.get_active()})
+
+
+        def on_manual_codex_resume(self, *_):
+            t_info = get_active_or_interrupted_codex_thread(max_age_seconds=86400, include_recent_completed=True)
+            if not t_info:
+                self.show_toast("No Codex chat found to resume.")
+                return
+            self.show_toast(f"Resuming Codex chat: {t_info['title']}...")
+
+            def worker():
+                res = resume_codex_thread(t_info["thread_id"], cwd=t_info.get("cwd"), wait_for_app_seconds=4.0)
+                GLib.idle_add(
+                    self.show_toast,
+                    f"Codex continuation sent ({res.get('method', 'ok')})!"
+                    if res.get("ok")
+                    else f"Error: {res.get('error')}",
+                )
+
+            threading.Thread(target=worker, daemon=True).start()
+
+
+        def refresh_automation_status(self):
+            st = get_auto_service_status()
+            if st["active"]:
+                self.svc_status_row.set_subtitle("🟢 Running and monitoring usage")
+                self.svc_toggle_btn.set_label("Stop service")
+                self.svc_toggle_btn.remove_css_class("suggested-action")
+                self.svc_toggle_btn.add_css_class("destructive-action")
+            else:
+                self.svc_status_row.set_subtitle("⚪ Stopped (start to enable automatic switching)")
+                self.svc_toggle_btn.set_label("Start service")
+                self.svc_toggle_btn.remove_css_class("destructive-action")
+                self.svc_toggle_btn.add_css_class("suggested-action")
+
+            self.log_label.set_label(get_recent_auto_service_logs(16))
+
+        def on_toggle_auto_service(self, *_):
+            st = get_auto_service_status()
+            ok, msg = set_auto_service_enabled(not st["active"])
+            self.refresh_automation_status()
+            self.show_toast(msg)
+
+        def on_save_auto_config_clicked(self, *_):
+            new_cfg = {
+                "codex_auto_switch": self.auto_codex_sw.get_active(),
+                "codex_auto_resume": self.codex_resume_switch_row.get_active(),
+                "codex_threshold": int(self.codex_thresh_row.get_value()),
+                "check_interval": int(self.interval_row.get_value()),
+                "resume_prompt": (self.prompt_entry_row.get_text() or "").strip()
+                or DEFAULT_AUTO_CONFIG["resume_prompt"],
+            }
+            save_auto_config(new_cfg)
+            restart_auto_service_if_active()
+            self.refresh_automation_status()
+            self.show_toast("Switching and continuation settings saved.")
+
+        # ---------------- EXISTING CODEX ACTIONS ---------------- #
+
+
+
+        def on_limits_fetched(self, res: dict[str, dict]):
+            self.fetching_limits = False
+            self.header_spinner.stop()
+            self.limits_cache.update(res)
+            self.refresh_list(fetch_limits=False)
+
+        def on_use_reset_credit(self, acc: dict, credit_id: str | None = None):
+            self.show_toast(f"{acc['email']}: using a usage reset credit...")
+
+            def worker():
+                res = consume_codex_reset_credit(acc, credit_id)
+                if res.get("ok"):
+                    GLib.idle_add(self.show_toast, f"✓ {acc['email']}: usage reset successfully.")
+                    GLib.idle_add(self.refresh_list, True)
+                else:
+                    GLib.idle_add(self.show_toast, f"Could not use reset credit: {res.get('error')}")
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def on_switch_clicked(self, acc: dict, force_start: bool = False):
+            if getattr(self, "switching_account", False):
+                self.show_toast("Switching account…")
+                return
+            active_threads = get_active_or_interrupted_codex_threads(max_age_seconds=3600)
+            do_resume = self.codex_resume_switch_row.get_active()
+            restart_app = self.restart_switch_row.get_active()
+            self.switching_account = True
+            self.accounts_group.set_sensitive(False)
+            self.switch_status.set_label("Switching account · Waiting for Codex to open…")
+            self.switch_status.set_visible(True)
+            def worker():
+                try:
+                    result = switch_to_account(acc, restart_app=restart_app, start_app_if_closed=force_start)
+                except Exception as exc:
+                    GLib.idle_add(self.on_switch_finished, False, str(exc))
+                    return
+                message = f"{acc['email']} · Codex is open and ready." if result.get("app_ready") else f"{acc['email']} selected. Restart disabled."
+                GLib.idle_add(self.on_switch_finished, True, message)
+                if do_resume and active_threads and result.get("app_ready"):
+                    resume_codex_threads(active_threads, wait_for_app_seconds=18.0)
+            threading.Thread(target=worker, daemon=True).start()
+
+        def on_switch_finished(self, ok, message):
+            self.switching_account = False
+            self.accounts_group.set_sensitive(True)
+            self.switch_status.set_label(message)
+            self.switch_status.set_visible(True)
+            if ok:
+                self.switch_status.remove_css_class("error")
+            else:
+                self.switch_status.add_css_class("error")
+            self.show_toast(message)
+            self.refresh_list(fetch_limits=ok)
+            return False
+
+        def on_delete_clicked(self, acc: dict):
+            try:
+                p = Path(acc["file_path"])
+                if p.exists():
+                    p.unlink()
+                self.refresh_list(fetch_limits=False)
+                self.show_toast(f"{acc['email']} removed from the list.")
+            except Exception as e:
+                self.show_toast(f"Could not remove account: {e}")
+
+        def on_copy_login_url(self, *_):
+            if not self.last_oauth_url:
+                self.show_toast("Sign-in link is not ready yet")
+                return
+            url = add_prompt_login(self.last_oauth_url)
+            clipboard = Gdk.Display.get_default().get_clipboard()
+            clipboard.set(url)
+            self.show_toast("Sign-in link copied.")
+
+        def start_login_flow(self, private: bool = True):
+            if self.login_proc is not None:
+                self.show_toast("A sign-in is already in progress.")
+                return
+
+            sync_current_auth()
+            self.backup_auth_bytes = AUTH_FILE.read_bytes() if AUTH_FILE.exists() else None
+            if AUTH_FILE.exists():
+                AUTH_FILE.unlink()
+
+            self.last_oauth_url = None
+            self.login_status_group.set_visible(True)
+            self.add_priv_btn.set_sensitive(False)
+            self.add_norm_btn.set_sensitive(False)
+
+            env = os.environ.copy()
+            env["BROWSER"] = "/bin/true"
+
+            def worker():
+                try:
+                    proc = subprocess.Popen(
+                        [CODEX_BIN, "login"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        env=env,
+                    )
+                    self.login_proc = proc
+                    url_opened = False
+                    for line in proc.stdout:
+                        m = re.search(r"(https://auth\.openai\.com/\S+|http://localhost:\d+/\S+)", line)
+                        if m and not url_opened:
+                            url_opened = True
+                            url = m.group(1).strip()
+                            self.last_oauth_url = url
+                            GLib.idle_add(open_url_in_browser, url, private)
+
+                    rc = proc.wait()
+                    self.login_proc = None
+                    GLib.idle_add(self.on_login_finished, rc == 0)
+                except Exception as e:
+                    self.login_proc = None
+                    GLib.idle_add(self.on_login_finished, False, str(e))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def on_login_finished(self, success: bool, err_msg: str = ""):
+            self.login_status_group.set_visible(False)
+            self.add_priv_btn.set_sensitive(True)
+            self.add_norm_btn.set_sensitive(True)
+
+            if success and AUTH_FILE.exists():
+                info = sync_current_auth()
+                if info:
+                    if self.restart_switch_row.get_active():
+                        restart_chatgpt_app(start_if_closed=False)
+                    self.refresh_list(fetch_limits=True)
+                    self.show_toast(f"Account added and activated: {info['email']}")
+                    return
+
+            if self.backup_auth_bytes and not AUTH_FILE.exists():
+                AUTH_FILE.write_bytes(self.backup_auth_bytes)
+                os.chmod(AUTH_FILE, 0o600)
+            self.refresh_list(fetch_limits=False)
+            if err_msg:
+                self.show_toast(f"Sign-in failed: {err_msg}")
+            else:
+                self.show_toast("Sign-in cancelled; previous account restored.")
+
+        def cancel_login_flow(self):
+            if self.login_proc:
+                try:
+                    self.login_proc.terminate()
+                except Exception:
+                    pass
+
+    app = UnifiedAccountSwitcherApp()
+    app.run([])
+
+
+# ---------------- CLI Mode ---------------- #
+
+def print_accounts_cli():
+    accounts, _ = list_accounts()
+    if not accounts:
+        print("No saved Codex accounts. To add one: codex-acc add")
+    else:
+        limits_map = fetch_all_limits_parallel(accounts)
+        print("\nSaved ChatGPT (Codex) accounts, usage, and reset credits:")
+        print("=" * 84)
+        for idx, acc in enumerate(accounts, 1):
+            mark = "★ [ACTIVE]" if acc["is_active"] else "         "
+            name_part = f" ({acc['name']})" if acc.get("name") else ""
+            until_part = f" | Ends: {acc['sub_until']}" if acc.get("sub_until") else ""
+            lim = limits_map.get(acc["id_key"]) or {}
+            if lim.get("ok"):
+                r5 = lim["rem_5h"]
+                rw = lim["rem_weekly"]
+                rst5 = f" (resets: {lim['reset_5h']})" if lim.get("reset_5h") and r5 < 100 else ""
+                rstw = f" (resets: {lim['reset_weekly']})" if lim.get("reset_weekly") and rw < 100 else ""
+                status_tag = "🔴 LIMIT REACHED" if lim.get("limit_reached") or r5 == 0 or rw == 0 else "🟢 AVAILABLE"
+                lim_str = f"    ↳ {status_tag}  |  5-hour: %{r5} Remaining{rst5}  |  Weekly: %{rw} Remaining{rstw}"
+                r_avail = lim.get("reset_available", 0)
+                g_30d = lim.get("granted_30d_count", 0)
+                if r_avail > 0:
+                    exp_s = f" (expires: {lim['reset_expires']})" if lim.get("reset_expires") else ""
+                    rst_info = f"🎁 {r_avail} reset credits available{exp_s}"
+                elif g_30d > 0:
+                    rst_info = (
+                        f"0 available (in the last 30 days: {g_30d} granted | | "
+                        f"Last granted: {lim.get('last_granted_str', '-')}, used: {lim.get('last_used_str', '-')})"
+                    )
+                else:
+                    rst_info = "0 available (no reset credits granted yet)"
+                lim_str += f"\n    ↳ 🔄 Reset credits: {rst_info}"
+            else:
+                lim_str = f"    ↳ Usage unavailable: {lim.get('error', 'Unknown error')}"
+            print(f" {idx}) {mark} {acc['email']}{name_part} [{acc['plan']}{until_part}]")
+            print(lim_str)
+        print("=" * 84)
+
+    return accounts
+
+
+def cli_add(private: bool = True):
+    sync_current_auth()
+    backup = AUTH_FILE.read_bytes() if AUTH_FILE.exists() else None
+    if AUTH_FILE.exists():
+        AUTH_FILE.unlink()
+
+    print("Your current account is backed up. Opening the browser for sign-in...")
+    env = os.environ.copy()
+    env["BROWSER"] = "/bin/true"
+    proc = subprocess.Popen(
+        [CODEX_BIN, "login"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+    )
+    opened = False
+    try:
+        for line in proc.stdout:
+            m = re.search(r"(https://auth\.openai\.com/\S+|http://localhost:\d+/\S+)", line)
+            if m and not opened:
+                opened = True
+                url = m.group(1).strip()
+                print(f"\nSign-in link:\n{add_prompt_login(url)}\n")
+                open_url_in_browser(url, private=private)
+        rc = proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+        rc = 1
+
+    if rc == 0 and AUTH_FILE.exists():
+        info = sync_current_auth()
+        if info:
+            restart_chatgpt_app(start_if_closed=False)
+            print(f"\n✓ New account saved and selected: {info['email']} ({info['plan']})")
+            return
+    if backup and not AUTH_FILE.exists():
+        AUTH_FILE.write_bytes(backup)
+        os.chmod(AUTH_FILE, 0o600)
+    print("\n✕ Sign-in cancelled; previous account preserved.")
+
+
+def main():
+    if any(arg in ("--help", "-h") for arg in sys.argv[1:]):
+        print("Codex Account Center (unofficial)\nUsage: codex-acc [gui | list | add | switch ACCOUNT | resume]")
+        return
+    ensure_dirs()
+    sync_current_auth()
+
+    args = sys.argv[1:]
+    if not args or args[0] in ("gui", "app"):
+        run_gui()
+        return
+
+    cmd = args[0]
+    if cmd in ("list", "ls", "status"):
+        print_accounts_cli()
+        return
+
+    if cmd in ("add", "login", "new"):
+        private = "--normal" not in args
+        cli_add(private=private)
+        return
+
+    if cmd in ("resume", "continue"):
+        t_info = get_active_or_interrupted_codex_thread(max_age_seconds=86400, include_recent_completed=True)
+        if not t_info:
+            print("No Codex chat found to resume.")
+            return
+        res = resume_codex_thread(t_info["thread_id"], cwd=t_info.get("cwd"))
+        print(json.dumps(res, ensure_ascii=False))
+        return
+
+    if cmd in ("switch", "use"):
+        target_arg = args[1] if len(args) > 1 else ""
+    else:
+        target_arg = cmd
+
+    accounts, _ = list_accounts()
+    if not target_arg:
+        accounts = print_accounts_cli()
+        if not accounts:
+            return
+        try:
+            target_arg = input("Account number to switch to (or 'a' to add one): ").strip()
+        except EOFError:
+            return
+        if target_arg.lower() == "a":
+            cli_add(private=True)
+            return
+
+    chosen = None
+    if target_arg.isdigit():
+        idx = int(target_arg) - 1
+        if 0 <= idx < len(accounts):
+            chosen = accounts[idx]
+    if not chosen:
+        for acc in accounts:
+            if target_arg.lower() in acc["email"].lower() or target_arg.lower() in acc.get("alias", "").lower():
+                chosen = acc
+                break
+
+    if not chosen:
+        print(f"Account not found: '{target_arg}'")
+        print_accounts_cli()
+        sys.exit(1)
+
+    switch_to_account(chosen, restart_app=True)
+    print(f"✓ Active account changed: {chosen['email']} ({chosen['plan']})")
+
+
+if __name__ == "__main__":
+    main()

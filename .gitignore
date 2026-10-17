@@ -1,0 +1,22 @@
+# Runtime state and credentials never belong in this repository.
+.codex/
+accounts/
+browser-profiles/
+auth.json
+_meta.json
+.env
+.env.*
+*.pem
+*.key
+*.sqlite*
+*.db
+*.log
+*.jsonl
+*.bak
+backups/
+work/
+outputs/
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
